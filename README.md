@@ -1,5 +1,7 @@
 # Issue Triage Agent
 
+[![tests](https://github.com/ShauRya765/issue-triage-agent/actions/workflows/test.yml/badge.svg)](https://github.com/ShauRya765/issue-triage-agent/actions/workflows/test.yml)
+
 A LangGraph agent that takes a real open issue from [vercel/next.js](https://github.com/vercel/next.js),
 extracts facts about it with an LLM, decides what to do with it using plain
 Python rules, pauses for a human to approve or edit the proposed actions, and
@@ -129,6 +131,15 @@ Unit tests (no API key, no network):
 ```bash
 ./venv/bin/python -m pytest tests/ -q
 ```
+
+That claim is enforced, not just asserted. `tests/conftest.py` blocks socket
+creation for every test, so a test that reaches for api.anthropic.com,
+api.github.com or Postgres fails with `NetworkUsedInTest` instead of quietly
+passing on a machine that happens to have credentials. CI
+([`.github/workflows/test.yml`](.github/workflows/test.yml), the badge at the
+top) runs the same suite on a clean checkout with no secrets configured and
+fails the build if `ANTHROPIC_API_KEY` or `DATABASE_URL` is set -- so a green
+badge means all 54 tests passed with no key, no database and no network.
 
 Eval (needs `ANTHROPIC_API_KEY`; `REPO` defaults to `vercel/next.js`):
 

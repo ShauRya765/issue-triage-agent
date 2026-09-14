@@ -1,0 +1,44 @@
+# Proves the claim the README makes: the triage decisions are made by
+# app.policy, not by a model, so the whole suite runs with no ANTHROPIC_API_KEY,
+# no DATABASE_URL and no network access. No secrets are referenced below, and
+# tests/conftest.py blocks socket creation, so a test that starts reaching out
+# to api.anthropic.com or Postgres fails here rather than passing quietly.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The repo's .env is gitignored, so a checkout has no key to load. This
+      # fails loudly if that ever stops being true, rather than letting a
+      # credentialed run masquerade as an offline one.
+      - name: Confirm no credentials are present
+        run: |
+          test ! -f .env || { echo "::error::.env present in a clean checkout"; exit 1; }
+          for var in ANTHROPIC_API_KEY DATABASE_URL GITHUB_TOKEN; do
+            if [ -n "${!var:-}" ]; then
+              echo "::error::$var is set; the suite must run without it"
+              exit 1
+            fi
+            echo "$var is unset"
+          done
+
+      - name: Run tests
+        run: pytest tests/ -q
