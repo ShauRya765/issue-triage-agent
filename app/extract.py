@@ -13,13 +13,56 @@ degrade to "we know nothing," which app.policy already treats conservatively
 import json
 import logging
 import os
+import random
 import re
+import time
 
 from langchain_anthropic import ChatAnthropic
 
+from app import usage
 from app.policy import COMPONENTS
 
 logger = logging.getLogger(__name__)
+
+# Retried status codes: 429 (rate limit), 529 (Anthropic "overloaded"), and the
+# transient 5xx family. Running the eval with --concurrency makes 429 the
+# expected case rather than an edge case, and without a retry it would land as
+# a silent {} -- scored as a miss, which would understate accuracy for a reason
+# that has nothing to do with the prompt.
+_RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+_MAX_ATTEMPTS = 5
+_MAX_BACKOFF_SECONDS = 30.0
+
+
+def _status_code(exc: Exception) -> int | None:
+    """Dig a status code out of an SDK exception, whatever shape it arrives in."""
+    for attr in ("status_code", "code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    return value if isinstance(value, int) else None
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for rate limits, overload and transient network faults.
+
+    Checked by duck-typing rather than by importing anthropic's exception
+    classes: anthropic is a transitive dependency of langchain-anthropic and is
+    not pinned here, so its exception hierarchy is not ours to rely on.
+    """
+    if (status := _status_code(exc)) is not None:
+        return status in _RETRY_STATUS
+    name = type(exc).__name__
+    return name.endswith(("ConnectionError", "TimeoutError", "APITimeoutError"))
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with full jitter, so parallel workers desynchronise."""
+    ceiling = min(_MAX_BACKOFF_SECONDS, 2.0**attempt)
+    return random.uniform(0, ceiling)
+
 
 _SYSTEM_PROMPT_TEMPLATE = """You extract structured facts from a GitHub issue. You do not \
 decide priority, you do not decide labels, and you do not decide whether the \
@@ -150,22 +193,48 @@ def extract_facts(title: str, body: str) -> dict:
     misconfiguration.
     """
     model_name = os.environ.get("MODEL", "claude-sonnet-5")
-    try:
-        model = ChatAnthropic(model=model_name, max_tokens=1024)
-        response = model.invoke(
-            [
-                ("system", _system_prompt()),
-                ("human", _build_user_prompt(title, body)),
-            ]
-        )
-        parsed = _parse_response(response.content)
-        if not parsed:
-            logger.warning("extract_facts: model replied but the response did not parse")
-        return parsed
-    except Exception as exc:
-        # Still fail closed -- policy treats {} conservatively and the graph
-        # keeps running. But log it: a bad model name, an expired key or a
-        # rejected parameter is indistinguishable from a contentless issue
-        # once this returns {}, and that silence hid a 400 for a whole run.
-        logger.warning("extract_facts failed (%s): %s", type(exc).__name__, exc)
-        return {}
+    messages = [
+        ("system", _system_prompt()),
+        ("human", _build_user_prompt(title, body)),
+    ]
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            model = ChatAnthropic(model=model_name, max_tokens=1024)
+            started = time.perf_counter()
+            response = model.invoke(messages)
+            wall_ms = (time.perf_counter() - started) * 1000
+            # Record before parsing: a reply that fails to parse still cost
+            # tokens and time, and hiding it would understate the real spend.
+            served_model, input_tokens, output_tokens = usage.extract_usage(response)
+            usage.record_call(served_model, input_tokens, output_tokens, wall_ms)
+            parsed = _parse_response(response.content)
+            if not parsed:
+                logger.warning(
+                    "extract_facts: model replied but the response did not parse"
+                )
+            return parsed
+        except Exception as exc:
+            # Rate limits and overload are worth waiting out; a bad key or a
+            # rejected parameter will fail identically every time, so retrying
+            # it just multiplies the delay before the real error is logged.
+            if _is_retryable(exc) and attempt < _MAX_ATTEMPTS - 1:
+                delay = _backoff_seconds(attempt)
+                logger.warning(
+                    "extract_facts: retryable %s (%s), sleeping %.1fs (attempt %d/%d)",
+                    type(exc).__name__,
+                    _status_code(exc),
+                    delay,
+                    attempt + 1,
+                    _MAX_ATTEMPTS,
+                )
+                time.sleep(delay)
+                continue
+            # Still fail closed -- policy treats {} conservatively and the graph
+            # keeps running. But log it: a bad model name, an expired key or a
+            # rejected parameter is indistinguishable from a contentless issue
+            # once this returns {}, and that silence hid a 400 for a whole run.
+            logger.warning("extract_facts failed (%s): %s", type(exc).__name__, exc)
+            return {}
+
+    return {}

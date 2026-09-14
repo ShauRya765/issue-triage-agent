@@ -6,7 +6,10 @@ just the record of what has happened to one issue as it moves through the
 graph.
 """
 
-from typing import Literal, TypedDict
+import operator
+from typing import Annotated, Literal, TypedDict
+
+from app.usage import LLMCall, NodeTiming
 
 
 class Issue(TypedDict):
@@ -91,3 +94,12 @@ class TriageState(TypedDict, total=False):
     # Recorded on the state so an autonomous run is auditable after the fact.
     review_required: bool
     review_reason: str
+    # Telemetry. Both lists use operator.add so each node appends its own record
+    # instead of overwriting the previous node's -- without a reducer, the last
+    # node to return would be the only one represented.
+    llm_calls: Annotated[list[LLMCall], operator.add]
+    node_timings: Annotated[list[NodeTiming], operator.add]
+    # Aggregate of the two lists above, recomputed by every node so a run that
+    # is parked at the human_review interrupt still reports what it has spent so
+    # far. See app.usage.summarise for the shape.
+    usage: dict

@@ -79,6 +79,9 @@ pool and recomputing on the remaining genuinely-triaged issues:
 31 / 64 carry exactly one component label (~48%)
 ```
 
+That estimate held up when the eval was later scaled to 800 fetched issues:
+175 of the 351 non-bot-closed ones qualify, or 49.9%. See [Results](#results).
+
 `COMPONENTS` (in `.env.example` / `app/policy.py`) is exactly the real
 non-noise label vocabulary found by that script -- not a guessed list.
 `vercel/next.js` applies component labels as bare names (`Turbopack`,
@@ -104,12 +107,18 @@ app/graph.py     extract -> fetch_context -> decide -> propose -> (human_review
                  interrupt | auto_approve) -> execute, checkpointed to Supabase
 app/main.py      FastAPI: GET /issues, POST /runs, POST /runs/{number},
                  POST /runs/{number}/approve, GET /runs/{number}
-eval/replay.py   fetch closed issues, run the same extract+policy path,
-                 score predicted vs actual component label
+app/usage.py     cost + latency telemetry: per-call tokens/wall time/model/
+                 node, aggregated per run, priced from env rates
+eval/replay.py   fetch closed issues (cached to eval/cache/), run the same
+                 extract+policy path in parallel, score predicted vs actual
+                 component label with per-component precision and recall
 tests/test_policy.py      priority, component, actions, escalation, the
                           autonomy gate, action validation
 tests/test_context.py     tier mapping and the fail-soft paths
 tests/test_graph.py       routing, the pause, edited approvals, idempotency
+tests/test_eval.py        the eval's exclusions and scoring arithmetic
+tests/test_usage.py       cost arithmetic, rate config, usage collection
+tests/conftest.py         blocks sockets, so the suite can't quietly go online
 ENGINEERING_NOTES.md      decisions, tradeoffs and what's still unproven
 scripts/check_labels.py   the label-vocabulary check described above
 scripts/check_db.py       connects to DATABASE_URL, runs the checkpointer's
@@ -144,11 +153,23 @@ badge means all 54 tests passed with no key, no database and no network.
 Eval (needs `ANTHROPIC_API_KEY`; `REPO` defaults to `vercel/next.js`):
 
 ```bash
-./venv/bin/python -m eval.replay --n 20 --version v1
+./venv/bin/python -m eval.replay --n 150 --version v4
 ```
 
-Prints accuracy and the most common want-to-got confusions, and writes
-per-issue rows to `eval/results/v1.json`.
+Scores 150 issues, which means fetching 800 (`--fetch`) because only ~22% of
+closed issues qualify. Extraction runs 8-way parallel (`--concurrency`); at that
+setting a 150-issue run takes about 75 seconds, and `extract_facts` backs off on
+429s so raising it trades throughput for retries.
+
+Fetched issues are cached to `eval/cache/`, so only the first run hits the GitHub
+API -- a rerun starts in about a second, and every version is scored against the
+same sample rather than a fresh one that has drifted. Pass `--refresh` to
+re-fetch.
+
+Prints the sample funnel, accuracy with a 95% confidence interval, the majority-
+class and random baselines over the same scored set, the abstention and mislabel
+rates, per-component precision and recall, and the most common want-to-got
+confusions; writes per-issue rows to `eval/results/v4.json`.
 
 API (needs `DATABASE_URL` pointing at a real Postgres -- the durable pause
 depends on it). This project uses **Supabase** for that Postgres:
@@ -278,30 +299,181 @@ descriptive string and writes nothing to GitHub. This project doesn't own
 `vercel/next.js`, so shadow mode should stay on unless you're pointing it at
 a repo you control.
 
+## Cost and latency
+
+Measured on the v5 run: the same 150 issues, `claude-sonnet-5`, priced at its
+list rate of $2.00/$10.00 per million input/output tokens. Both rates are read
+from `COST_PER_MTOK_INPUT` / `COST_PER_MTOK_OUTPUT`, because the rate is a
+deployment fact -- a different model, a negotiated rate, or Bedrock/Vertex
+billing all change it, and none of those should need a code edit to price
+correctly.
+
+| | Per triaged issue | Over 150 issues |
+|---|---|---|
+| Cost | **$0.0082** (0.8 cents) | $1.23 |
+| Input tokens | 2,283 | 342,000 |
+| Output tokens | 362 | 54,000 |
+| LLM calls | 1 | 150 |
+
+Latency, per issue, extraction only:
+
+| | |
+|---|---|
+| median | **3.3s** |
+| p95 | **6.5s** |
+| max | 9.7s |
+
+Those are the eval's numbers, and the eval calls `extract_facts` directly. A
+full graph run also fetches reporter context, so measured end-to-end over real
+issues (6 runs, to the interrupt) the per-node median breaks down as:
+
+```
+extract         5.28s     <- the model call
+fetch_context   0.48s     <- GitHub search API
+decide          0.00s     <- pure Python
+propose         0.00s
+TOTAL           5.68s     (max 9.94s)
+```
+
+Extraction is ~93% of a run. That is the whole reason every node is timed and
+not just the LLM one: before measuring, the GitHub lookup was the plausible
+suspect, and it turned out to be under half a second.
+
+**What dominates the cost: input tokens, at 56% of the bill (output is 44%) --
+and within those, the issue text itself, not the prompt.** The fixed system
+prompt is ~855 tokens of the 2,283-token average input, so 37% of input and 21%
+of total cost; the other 63% is the issue body, which varies from a one-line
+report to a full stack trace. The practical consequence is that the one clearly
+addressable piece of waste is that 855-token prompt, identical on every call and
+resent every time: prompt caching would cut most of that 21%, and it is not
+enabled here. Beyond that, cost scales with how much users write, which is not
+something the agent controls.
+
+At 0.8 cents per issue, triaging every issue `vercel/next.js` closes in a day is
+a rounding error; the reason to watch the number is that it is per-issue and
+linear, so a repo with 100x the volume pays 100x.
+
+One detail the v5 run justified: usage is recorded *before* the response is
+parsed. v5 had one extraction fail to parse, and all 150 calls still show in the
+token totals -- a reply that comes back unusable cost exactly as much as one that
+worked, and accounting that hid it would understate the real spend.
+
+Telemetry is recorded per call (`input_tokens`, `output_tokens`, `wall_ms`, the
+model that actually served it, and the node that made the call) and per node
+execution, then aggregated onto the graph state. `GET /runs/{number}` returns
+the aggregate, recomputed from the raw records so it reflects the currently
+configured rates. It is recomputed by every node rather than once at the end, so
+a run parked at the human-review interrupt can still report what it has spent --
+and because the thread id is permanent per issue, re-running an issue adds to
+its bill rather than resetting it, which is the honest accounting.
+
 ## Results
 
-Run against `vercel/next.js` closed issues. Only issues carrying exactly one
-`COMPONENTS` label are scored, so 15 qualified out of 80 fetched. The ~48%
-single-label figure from the vocabulary check is the meaningful baseline.
+Run against `vercel/next.js` closed issues. Two filters decide what is scorable,
+and the funnel is printed on every run so the sample is auditable:
 
-| Version | n scored | Accuracy | Change |
-|---|---|---|---|
-| v1 | 15 | 40.0% | First real run. 3/15 extractions failed outright (`response.content` arrives as a list of content blocks on newer models, not a string -- the regex in `_parse_response` raised `TypeError`). |
-| v2 | 15 | 53.3% | Content-block handling fixed; zero extraction failures. Every remaining miss abstained to `needs-triage` -- not one wrong label. |
-| v3 | 15 | **66.7%** | Injected the real label vocabulary into the extraction prompt. Diagnosis: the model was confident (6/7 misses at `high`) but naming areas that don't exist -- `next-devtools`, `Use Cache`, `Telemetry`. It was guessing a taxonomy nobody had shown it. |
+```
+fetched closed issues                800
+- bot-closed (invalid link/locked)   449
+- no single component label          176
+= eligible to score                  175
+scored                               150
+```
 
-**v3's remaining 5 misses split 3 abstentions / 2 mislabels.** That split is the
-interesting part: constraining the vocabulary traded abstentions for a small
-number of genuine errors (`Performance` -> `Cache Components`, twice). Before
-v3 the system never applied a wrong label, only declined to route. Which of
-those failure modes is preferable is a product decision, not a technical one --
-and the autonomy gate already treats them differently, since a `needs-triage`
-result can never execute without a human.
+Bot-closed issues are excluded because an issue whose only labels are
+`invalid link` / `locked` was closed by automation and never triaged -- there is
+no maintainer judgment there to score against. That exclusion is defined once,
+in `eval/replay.py`, and imported by `scripts/check_labels.py` so the two can't
+drift. Of what survives, only issues carrying exactly one `COMPONENTS` label are
+scored: zero means nobody routed it, two or more means "the right answer" isn't a
+single value.
 
-**On reading too much into this:** n=15 means one issue moves accuracy by 6.7
-points, so the gap between v2 and v3 is real but the precise figure isn't
-stable. A larger run is the obvious next step.
+Those two filters are why scoring 150 means fetching 800: only ~22% of fetched
+issues survive both. That is the same finding as the vocabulary check's ~48%,
+not a contradiction -- 175 of the 351 non-bot-closed issues qualify (49.9%,
+confirming the earlier 31/64 estimate at 5x the sample), and 56% of everything
+fetched is bot-closed before that filter even applies.
+
+| | n scored | Accuracy | 95% CI | Change |
+|---|---|---|---|---|
+| *baseline: random* | 150 | 16.9% | -- | Guess a component with probability equal to its frequency; expected accuracy is the sum of squared frequencies. Reads the issue not at all. |
+| *baseline: majority class* | 150 | 37.3% | -- | Always answer `Turbopack` (56 of 150). Reads the issue not at all. |
+| v1 | 15 | 40.0% | [20%, 64%] | First real run. 3/15 extractions failed outright (`response.content` arrives as a list of content blocks on newer models, not a string -- the regex in `_parse_response` raised `TypeError`). |
+| v2 | 15 | 53.3% | [30%, 75%] | Content-block handling fixed; zero extraction failures. Every remaining miss abstained to `needs-triage` -- not one wrong label. |
+| v3 | 15 | 66.7% | [42%, 85%] | Injected the real label vocabulary into the extraction prompt. Diagnosis: the model was confident (6/7 misses at `high`) but naming areas that don't exist -- `next-devtools`, `Use Cache`, `Telemetry`. It was guessing a taxonomy nobody had shown it. |
+| v4 | **150** | **74.0%** | **[66%, 80%]** | **Sample size only.** Identical prompt, identical policy -- v4 is v3 measured properly, not a new change. |
+| v5 | 150 | 73.3% | [66%, 80%] | Cost/latency instrumentation added; prompt and policy still identical. Same 150 issues, so this doubles as a same-config replication of v4: 73.3% vs 74.0% is one issue's difference, which is what run-to-run variance looks like at this n. |
+
+Both baselines are computed by `eval.replay` over the same scored set as the
+headline number, and printed on every run. They are sample-specific, so the two
+rows above describe v4's 150 issues; on the 15-issue sample that v1-v3 used, the
+majority-class bar was 26.7% and random was 14.7%. Read each version against the
+bar for its own sample -- v1's 40%, for instance, is only ~1.5x its sample's
+majority class, which is the correct way to see that a silently-broken extractor
+was barely beating a constant answer.
+
+**v4 differs from v3 in exactly one respect: the number of issues scored.** The
+extraction prompt, `app/policy.py`, and the model (`claude-sonnet-5`) are
+unchanged between the two. Nothing was tuned in response to v3's output. The
+point of the run was to find out what the v3 system actually scores, because
+n=15 could not tell us. The samples nest cleanly, too: v1, v2 and v3 all scored
+the *same* 15 issues, and all 15 are among v4's 150, so v4 is a strict superset
+rather than a fresh draw.
+
+**What that bought, and what it cost.** v3's interval was 43 points wide; v4's is
+14. But those intervals overlap heavily, so v4 is *not* evidence that the system
+improved -- 74.0% is the better estimate of what v3 was already doing, and the
+honest reading is that v3's 66.7% was a noisy sample of roughly this. The same
+caveat applies backwards: the v1 -> v2 -> v3 deltas were each measured at n=15,
+so their direction is more trustworthy than their size.
+
+**Is 74% good? Yes, and by a clear margin -- it is 2.0x the majority-class
+baseline.** That is the comparison worth stating plainly, because it is the one
+that could have gone badly: on a repo where 37% of triaged issues are `Turbopack`,
+a classifier that had learned nothing except "say Turbopack" would score 37.3%,
+and a respectable-looking number can hide exactly that. This one doesn't. The
+distance from 37.3% to 74.0% is the part attributable to actually reading the
+issue.
+
+**And the margin widens on the hard part of the sample.** `Turbopack` is 56 of
+the 150 scored issues (37%), and it is the label the extractor handles best --
+98.1% precision, 94.6% recall -- so the obvious worry is that the dominant class
+is carrying the headline. Removing it tests that directly: on the remaining 94
+issues the agent scores 61.7% against a majority-class bar of 18.1% (`Runtime`),
+a lift of 3.4x rather than 2.0x. So the 74% is *diluted* by Turbopack in relative
+terms, not propped up by it -- the easy class raises the absolute number while
+lowering the multiple. What remains true is that 74% describes this repo's label
+distribution, and a repo with no dominant area would report a lower absolute
+accuracy for the same underlying quality.
+
+**The 26% of misses splits 18.7% abstentions / 7.3% mislabels.** That asymmetry
+is the number to watch, because the two failures cost different things: a
+`needs-triage` result can never execute without a human (see the autonomy gate),
+while a wrong label is a wrong action taken autonomously. Per-component
+precision and recall are printed for the same reason -- precision is what
+justifies letting a label apply itself, recall is how much triage work actually
+gets absorbed, and abstaining costs recall while never costing precision.
+
+Two components account for most of the damage:
+
+- **`Runtime` recall is 23.5%** (4 of 17 found) -- the worst in the sample. It's
+  a catch-all area whose issues don't announce themselves, and 9 of the 13 misses
+  abstained rather than guessed.
+- **`Cache Components` precision is 36.4%** -- 11 predictions against 5 real
+  ones. It has become the sink the model reaches for when an issue mentions
+  caching at all, pulling in `Runtime`, `Performance`, `React` and `Headers`.
+  This is the one place the constrained vocabulary from v3 actively backfired,
+  and it's the obvious next thing to fix.
+
+**On the one change to the measured path.** `extract_facts` gained retry with
+jittered backoff on 429/529, because `--concurrency` makes rate limiting the
+expected case and a swallowed 429 would have scored as a miss -- deflating
+accuracy for a reason unrelated to the prompt. It is a reliability change, not a
+prompt change, and it demonstrably didn't alter the outcome here: v4 recorded
+zero extraction failures, so no retry changed a row.
 
 Earlier runs are kept rather than overwritten: `eval/results/v1.json` is the
 record of what a silently-broken extractor scores, which is the comparison that
-makes the later numbers meaningful.
+makes the later numbers meaningful. Fetched issues are cached to `eval/cache/`
+(gitignored, ~3MB), so re-running scores every version against the same sample
+instead of a fresh one that has drifted.

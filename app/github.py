@@ -6,11 +6,82 @@ happened instead. Reads always hit the real API -- there is no shadow mode
 for reads, since reading a public repo's issues has no side effects.
 """
 
+import logging
 import os
+import random
+import time
 
 import httpx
 
 GITHUB_API = "https://api.github.com"
+
+logger = logging.getLogger(__name__)
+
+# The REST API allows 5000 requests/hour authenticated but only 60
+# unauthenticated, and it answers an exhausted budget with 403 (not 429) plus a
+# reset timestamp. Both shapes are handled in _get: a large eval fetch is the
+# one caller that can realistically hit either.
+_MAX_RETRIES = 5
+_MAX_SLEEP_SECONDS = 60.0
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """How long the API is asking us to wait, or None if it isn't asking."""
+    if (retry_after := resp.headers.get("Retry-After")) is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            return None
+    # Secondary/primary rate limit: remaining hits 0 and reset is absolute epoch
+    # seconds. Only meaningful on a 403/429, checked by the caller.
+    if resp.headers.get("X-RateLimit-Remaining") == "0":
+        try:
+            reset = float(resp.headers["X-RateLimit-Reset"])
+        except (KeyError, ValueError):
+            return None
+        return max(0.0, reset - time.time())
+    return None
+
+
+def _get(client: httpx.Client, path: str, params: dict | None = None) -> httpx.Response:
+    """GET with backoff on rate limits and transient server errors.
+
+    Retries 429/403-with-reset (rate limited) and 5xx. Anything else raises
+    immediately -- a 404 is not worth waiting out.
+    """
+    for attempt in range(_MAX_RETRIES):
+        resp = client.get(path, params=params)
+
+        if resp.status_code in (403, 429):
+            wait = _retry_after_seconds(resp)
+            if wait is not None and attempt < _MAX_RETRIES - 1:
+                # A primary-limit reset can be up to an hour out; don't silently
+                # block the process for that long, surface it instead.
+                if wait > _MAX_SLEEP_SECONDS:
+                    resp.raise_for_status()
+                logger.warning(
+                    "github: rate limited on %s, sleeping %.1fs (attempt %d/%d)",
+                    path,
+                    wait,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                )
+                time.sleep(wait + random.uniform(0, 1))
+                continue
+
+        if resp.status_code >= 500 and attempt < _MAX_RETRIES - 1:
+            backoff = min(2.0**attempt, _MAX_SLEEP_SECONDS) + random.uniform(0, 1)
+            logger.warning(
+                "github: %d on %s, retrying in %.1fs", resp.status_code, path, backoff
+            )
+            time.sleep(backoff)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    resp.raise_for_status()
+    return resp
 
 
 def _shadow_mode() -> bool:
@@ -43,48 +114,54 @@ def _issue_to_dict(repo: str, raw: dict) -> dict:
     }
 
 
-def fetch_open(repo: str, n: int = 20) -> list[dict]:
-    """Fetch the n most recently updated open issues (PRs excluded)."""
+PER_PAGE = 100
+
+
+def _fetch_issues(repo: str, state: str, n: int) -> list[dict]:
+    """Page through the issues list until n non-PR issues are collected.
+
+    Deduplicates by issue number. The default sort is `updated` descending, so
+    on an active repo an issue touched mid-fetch can shift between pages and be
+    returned twice (or skipped); the eval reads several hundred issues across
+    many pages, which makes that likely rather than theoretical. Dedupe keeps
+    the sample honest -- without it the same issue could be scored twice and
+    quietly weight the accuracy figure.
+    """
+    seen: set[int] = set()
     issues: list[dict] = []
     with _client() as client:
         page = 1
         while len(issues) < n:
-            resp = client.get(
+            resp = _get(
+                client,
                 f"/repos/{repo}/issues",
-                params={"state": "open", "per_page": 100, "page": page},
+                params={"state": state, "per_page": PER_PAGE, "page": page},
             )
-            resp.raise_for_status()
             batch = resp.json()
             if not batch:
-                break
-            issues.extend(raw for raw in batch if "pull_request" not in raw)
+                break  # ran out of issues before reaching n
+            for raw in batch:
+                if "pull_request" in raw or raw["number"] in seen:
+                    continue
+                seen.add(raw["number"])
+                issues.append(_issue_to_dict(repo, raw))
             page += 1
-    return [_issue_to_dict(repo, raw) for raw in issues[:n]]
+    return issues[:n]
+
+
+def fetch_open(repo: str, n: int = 20) -> list[dict]:
+    """Fetch the n most recently updated open issues (PRs excluded)."""
+    return _fetch_issues(repo, "open", n)
 
 
 def fetch_closed(repo: str, n: int = 20) -> list[dict]:
     """Fetch the n most recently updated closed issues (PRs excluded), with labels."""
-    issues: list[dict] = []
-    with _client() as client:
-        page = 1
-        while len(issues) < n:
-            resp = client.get(
-                f"/repos/{repo}/issues",
-                params={"state": "closed", "per_page": 100, "page": page},
-            )
-            resp.raise_for_status()
-            batch = resp.json()
-            if not batch:
-                break
-            issues.extend(raw for raw in batch if "pull_request" not in raw)
-            page += 1
-    return [_issue_to_dict(repo, raw) for raw in issues[:n]]
+    return _fetch_issues(repo, "closed", n)
 
 
 def fetch_issue(repo: str, number: int) -> dict:
     with _client() as client:
-        resp = client.get(f"/repos/{repo}/issues/{number}")
-        resp.raise_for_status()
+        resp = _get(client, f"/repos/{repo}/issues/{number}")
     return _issue_to_dict(repo, resp.json())
 
 
@@ -101,11 +178,11 @@ def search_issue_count(repo: str, author: str) -> int | None:
     """
     try:
         with _client() as client:
-            resp = client.get(
+            resp = _get(
+                client,
                 "/search/issues",
                 params={"q": f"repo:{repo} author:{author} type:issue", "per_page": 1},
             )
-            resp.raise_for_status()
             return int(resp.json().get("total_count", 0))
     except (httpx.HTTPError, ValueError, KeyError):
         return None

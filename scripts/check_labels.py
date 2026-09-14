@@ -12,12 +12,12 @@ from collections import Counter
 
 import httpx
 
-REPO = os.environ.get("REPO", "vercel/next.js")
+# The bot-closed exclusion is defined once, in the eval that depends on it, and
+# imported here so the vocabulary check and the eval can never disagree about
+# which issues were never triaged in the first place.
+from eval.replay import is_bot_closed
 
-# Labels that are applied by bots/moderation, not by a maintainer doing
-# component triage. An issue whose only labels are these was never a
-# candidate for a component label in the first place.
-AUTOMATION_ONLY_LABELS = {"invalid link", "locked"}
+REPO = os.environ.get("REPO", "vercel/next.js")
 
 # Additional generic labels to ignore when counting "component" labels.
 GENERIC_LABELS = {
@@ -51,11 +51,6 @@ def fetch_closed_issues(repo: str, pages: int = 8, per_page: int = 100) -> list[
     return [i for i in issues if "pull_request" not in i]
 
 
-def is_bot_closed(issue: dict) -> bool:
-    names = {label["name"] for label in issue["labels"]}
-    return bool(names) and names.issubset(AUTOMATION_ONLY_LABELS)
-
-
 def component_labels(issue: dict) -> list[str]:
     return [
         label["name"]
@@ -78,7 +73,9 @@ def main() -> None:
     # Bot-closed issues (only "invalid link"/"locked") were never triage
     # candidates -- exclude them before asking whether the label scheme is
     # dense enough to eval against.
-    triaged = [i for i in issues if not is_bot_closed(i)]
+    triaged = [
+        i for i in issues if not is_bot_closed([la["name"] for la in i["labels"]])
+    ]
     sample = triaged[:100]
     exactly_one = sum(1 for i in sample if len(component_labels(i)) == 1)
 

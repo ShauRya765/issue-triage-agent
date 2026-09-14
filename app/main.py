@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel
 
-from app import github, policy
+from app import github, policy, usage
 from app.graph import get_graph, thread_config
 
 app = FastAPI(title="Issue Triage Agent")
@@ -171,6 +171,14 @@ def get_run(number: int):
     return {
         "values": state.values,
         "next": state.next,
+        # Recomputed from the raw per-call and per-node records rather than read
+        # back from state["usage"], so the figures reflect the current configured
+        # rates and are correct even for a checkpoint written before the
+        # aggregate existed. state["usage"] is still there under "values".
+        "usage": usage.summarise(
+            state.values.get("llm_calls", []),
+            state.values.get("node_timings", []),
+        ),
     }
 
 

@@ -6,8 +6,10 @@ GitHub API calls with idempotency keys so a resumed/replayed run can't
 double-label or double-comment.
 """
 
+import functools
 import hashlib
 import os
+import time
 
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, StateGraph
@@ -16,7 +18,7 @@ from psycopg import Connection
 from psycopg.rows import dict_row
 
 from app import context as context_module
-from app import github, policy
+from app import github, policy, usage
 from app.extract import extract_facts
 from app.state import Action, Facts, TriageState
 
@@ -143,6 +145,46 @@ def execute_node(state: TriageState) -> dict:
     return {"executed_keys": executed, "execution_log": log}
 
 
+def _instrumented(name: str, fn):
+    """Wrap a node so it records its own wall time and any LLM calls it made.
+
+    The aggregate is recomputed here, on every node, rather than once at the end
+    of the graph. A run that stops at the human_review interrupt never reaches a
+    final node, and GET /runs/{number} still has to be able to report what that
+    run cost -- so the freshest aggregate has to be on the state at every pause
+    point, not just at END.
+
+    The collector is opened inside the wrapper so it lives in whichever thread
+    LangGraph chose to run the node on; see app.usage for why that matters.
+
+    One gap, deliberately left: human_review_node raises to pause, so the
+    execution that hits the interrupt records nothing. It is timed on the
+    resuming execution instead, and that is the honest number anyway -- the
+    interval a human spends deciding is not the agent's latency.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(state: TriageState) -> dict:
+        with usage.collector() as calls, usage.node(name):
+            started = time.perf_counter()
+            update = fn(state)
+            wall_ms = (time.perf_counter() - started) * 1000
+
+        timing = {"node": name, "wall_ms": round(wall_ms, 1)}
+        merged = dict(update or {})
+        merged["llm_calls"] = calls
+        merged["node_timings"] = [timing]
+        # The reducers have not run yet, so combine by hand to summarise over
+        # this node's contribution plus everything already on the state.
+        merged["usage"] = usage.summarise(
+            list(state.get("llm_calls", [])) + calls,
+            list(state.get("node_timings", [])) + [timing],
+        )
+        return merged
+
+    return wrapper
+
+
 def _autonomous_enabled() -> bool:
     """Read at call time, not import time, so tests and the API can toggle it."""
     return os.environ.get("AUTONOMOUS", "false").lower() == "true"
@@ -150,15 +192,23 @@ def _autonomous_enabled() -> bool:
 
 def build_graph(checkpointer: PostgresSaver):
     graph = StateGraph(TriageState)
-    graph.add_node("extract", extract_node)
+
+    # Every node goes through _instrumented, including the ones that make no
+    # model call -- otherwise the breakdown could only ever confirm that the LLM
+    # call is slow. Measured on real issues: extract ~5.3s, fetch_context ~0.5s,
+    # decide and propose effectively free.
+    def add(name: str, fn) -> None:
+        graph.add_node(name, _instrumented(name, fn))
+
+    add("extract", extract_node)
     # Node name differs from the "context" state key on purpose: LangGraph
     # rejects a node that shadows a key in the state schema.
-    graph.add_node("fetch_context", context_node)
-    graph.add_node("decide", decide_node)
-    graph.add_node("propose", propose_node)
-    graph.add_node("human_review", human_review_node)
-    graph.add_node("auto_approve", auto_approve_node)
-    graph.add_node("execute", execute_node)
+    add("fetch_context", context_node)
+    add("decide", decide_node)
+    add("propose", propose_node)
+    add("human_review", human_review_node)
+    add("auto_approve", auto_approve_node)
+    add("execute", execute_node)
 
     graph.set_entry_point("extract")
     graph.add_edge("extract", "fetch_context")
