@@ -7,6 +7,19 @@ extracts facts about it with an LLM, decides what to do with it using plain
 Python rules, pauses for a human to approve or edit the proposed actions, and
 then executes them (or, in `SHADOW_MODE`, just says what it would have done).
 
+## Results at a glance
+
+| | |
+|---|---|
+| **Component-label accuracy** | **74.0%** on 150 closed issues, 95% CI [66%, 80%]. An identical re-run scored 73.3%. |
+| **vs. naive baselines** | 37.3% always-guess-the-most-common-label, 16.9% weighted random -- the agent is **2.0x** the majority-class bar, and 3.4x once the dominant label is removed. |
+| **Failure split** | 18.7% abstained to `needs-triage`, 7.3% applied a wrong label. Abstentions can never execute without a human. |
+| **Cost and latency** | **$0.0082** per triaged issue; **3.3s** median, **6.5s** p95. |
+| **Durable pause** | **Verified against real Postgres**, not just `MemorySaver`: one process paused at human review and exited, a second process recovered the state, applied an *edited* action list, and executed it -- once. |
+| **Who decides** | Plain Python in `app/policy.py`, never the model. It makes zero LLM calls, and its tests pass with no API key and no network. |
+
+Details: [Results](#results) · [Cost and latency](#cost-and-latency) · [Human in the loop](#human-in-the-loop-and-running-alone)
+
 ## The central design rule
 
 **The model extracts, the code decides.**
@@ -14,7 +27,7 @@ then executes them (or, in `SHADOW_MODE`, just says what it would have done).
 | | Model (`app/extract.py`) | Code (`app/policy.py`) |
 |---|---|---|
 | Can decide | What the issue text says: has a version, has a repro, has logs, has expected behaviour, claimed area, confidence in that claim, kind of issue | Priority (P0-P3), which label to apply, what "enough information" means, which actions to take, **and whether a human must approve the run** |
-| Cannot decide | Priority, labels, actions, sufficiency of information, whether to act alone | Anything about the issue's content -- it only ever sees facts already extracted, plus a fetched context record |
+| Cannot decide | Priority, labels, actions, sufficiency of information, whether to act alone | Anything about the issue's content -- it only ever sees facts already extracted, the raw issue body for literal pattern matching, and a fetched context record |
 
 A third input sits alongside the model: `app/context.py` looks up *who filed
 the issue* from the GitHub API. That's a fetch, not a judgment -- no model is
@@ -22,12 +35,13 @@ involved -- and `policy` reads it the way a human triager glances at who
 opened a ticket before deciding how fast to move.
 
 Concretely: `app/policy.py` makes zero LLM calls and imports nothing from
-`app/graph.py`. Its three functions (`priority`, `component`, `actions`) are
-pure functions over a `Facts` dict and a list of GitHub labels. `tests/test_policy.py`
-passes with `ANTHROPIC_API_KEY` unset and no network access -- that's the
-proof the decisions don't depend on the model. If you find yourself wanting
-an LLM call inside `policy.py`, the fix is a new field on `Facts` extracted
-by the model, not a new import.
+`app/graph.py`. Its public functions (`priority`, `component`, `actions`,
+`review_reason`, `requires_review`, `validate_actions`) are pure functions over
+a `Facts` dict, a list of GitHub labels, and a fetched context record.
+`tests/test_policy.py` passes with `ANTHROPIC_API_KEY` unset and no network
+access -- that's the proof the decisions don't depend on the model. If you
+find yourself wanting an LLM call inside `policy.py`, the fix is a new field
+on `Facts` extracted by the model, not a new import.
 
 Why this split, concretely: an LLM can misjudge severity, or drift over time
 as prompts get tweaked, and there's no way to unit test "the model's
@@ -148,7 +162,7 @@ passing on a machine that happens to have credentials. CI
 ([`.github/workflows/test.yml`](.github/workflows/test.yml), the badge at the
 top) runs the same suite on a clean checkout with no secrets configured and
 fails the build if `ANTHROPIC_API_KEY` or `DATABASE_URL` is set -- so a green
-badge means all 54 tests passed with no key, no database and no network.
+badge means all 114 tests passed with no key, no database and no network.
 
 Eval (needs `ANTHROPIC_API_KEY`; `REPO` defaults to `vercel/next.js`):
 
@@ -235,11 +249,34 @@ real database.
 
 The graph has exactly one branch, after `propose`:
 
+```mermaid
+flowchart LR
+    extract["extract<br/>LLM - reports facts"]
+    context["fetch_context<br/>GitHub - who filed it"]
+    decide["decide<br/>policy - priority + component"]
+    propose["propose<br/>policy - actions + review_reason"]
+    review["human_review<br/>interrupt - checkpoints and stops"]
+    auto["auto_approve<br/>agent's own authority"]
+    execute["execute<br/>GitHub writes, idempotency-keyed"]
+
+    extract --> context --> decide --> propose
+    propose -->|"needs a human"| review
+    propose -->|"gate cleared it"| auto
+    review --> execute
+    auto --> execute
+    execute --> done(["END"])
+
+    classDef llm fill:#fde68a,stroke:#b45309,color:#111
+    classDef rules fill:#bfdbfe,stroke:#1d4ed8,color:#111
+    classDef pause fill:#fecaca,stroke:#b91c1c,color:#111
+    class extract llm
+    class decide,propose rules
+    class review pause
 ```
-extract -> fetch_context -> decide -> propose --+--> human_review (interrupt) --+--> execute
-                                                |                               |
-                                                +--> auto_approve --------------+
-```
+
+The one LLM node is amber, the two nodes that make decisions are blue, and the
+pause is red -- the colours are the design rule made visible: nothing amber
+decides anything.
 
 Both paths converge on the same `execute` node, so an autonomous run and an
 approved run execute through identical code, including the idempotency check.

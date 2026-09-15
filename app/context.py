@@ -22,7 +22,7 @@ maintainer's report the moment the API got slow.
 """
 
 from app.github import search_issue_count
-from app.state import Issue, ReporterContext
+from app.state import Issue, ReporterContext, Tier
 
 # GitHub's author_association values that mean the reporter is inside the
 # project. These people can already label and close issues themselves, so a
@@ -34,7 +34,7 @@ _INTERNAL = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _CONTRIBUTOR = frozenset({"CONTRIBUTOR"})
 
 
-def _tier(author_association: str) -> str:
+def _tier(author_association: str) -> Tier:
     """Normalise GitHub's association into the three bands policy cares about.
 
     Unrecognised values (GitHub has added values here before, e.g.

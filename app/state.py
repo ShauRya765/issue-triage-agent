@@ -12,6 +12,13 @@ from typing import Annotated, Literal, TypedDict
 from app.usage import LLMCall, NodeTiming
 
 
+# Named so the functions that produce these values can be annotated with the
+# same type the TypedDicts expect, instead of widening to str at the boundary
+# and losing the check exactly where a typo would do damage.
+Priority = Literal["P0", "P1", "P2", "P3"]
+Tier = Literal["internal", "contributor", "external"]
+
+
 class Issue(TypedDict):
     repo: str
     number: int
@@ -38,7 +45,16 @@ class Evidence(TypedDict, total=False):
 
 
 class Facts(TypedDict):
-    """Structured output of the extract node. Model-authored, never a decision."""
+    """What the extract node produces. Model-authored, never a decision.
+
+    Every field here except `body` is the model's report of what the issue text
+    says. `body` is declared here deliberately rather
+    than smuggled in as an undeclared key: app.policy needs the raw text to
+    match its data-loss and build-breaking patterns, and those patterns must run
+    against what the reporter actually wrote, not against a model's paraphrase
+    of it. Keeping it on the same dict is what lets policy stay a pure function
+    of its arguments, with no second fetch and no graph import.
+    """
 
     has_version: bool
     has_reproduction: bool
@@ -48,6 +64,9 @@ class Facts(TypedDict):
     area_confidence: Literal["high", "medium", "low"]
     kind: Literal["bug", "feature", "question", "docs"]
     evidence: Evidence
+    # Passed through untouched from the issue -- NOT model output. The only
+    # field here that no model authored.
+    body: str
 
 
 class ReporterContext(TypedDict):
@@ -66,7 +85,7 @@ class ReporterContext(TypedDict):
     login: str
     # Normalised from author_association into the three bands policy cares
     # about: "internal", "contributor", "external".
-    tier: Literal["internal", "contributor", "external"]
+    tier: Tier
     # Total issues this person has previously filed on this repo.
     prior_issues: int
     # True when the lookup failed (rate limit, network, deleted account).

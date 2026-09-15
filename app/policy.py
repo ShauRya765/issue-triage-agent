@@ -11,9 +11,8 @@ facts schema instead, as a new fact, not a new import here.
 
 import os
 import re
-from typing import Literal
 
-from app.state import Action, Facts, ReporterContext
+from app.state import Action, Facts, Priority, ReporterContext
 
 # Real component labels used on vercel/next.js, derived by scripts/check_labels.py
 # (see README). Anything not in this set is not a component vercel/next.js
@@ -67,10 +66,10 @@ def _has_pattern_signal(body: str) -> bool:
 # to catch people who file regularly and whose reports have proven actionable.
 ESTABLISHED_REPORTER_ISSUES = 3
 
-_LADDER = ["P3", "P2", "P1", "P0"]
+_LADDER: list[Priority] = ["P3", "P2", "P1", "P0"]
 
 
-def _escalate(priority_value: str) -> str:
+def _escalate(priority_value: Priority) -> Priority:
     """Move one step up the ladder. Never reaches P0.
 
     P0 is reserved for the hard signals in priority() -- a security label or a
@@ -103,7 +102,7 @@ def priority(
     facts: Facts,
     labels: list[str],
     context: ReporterContext | None = None,
-) -> Literal["P0", "P1", "P2", "P3"]:
+) -> Priority:
     """Decide priority by rule. P0 requires a matched signal, never the model's say-so.
 
     context is optional so this stays callable (and testable) with nothing but
@@ -115,6 +114,7 @@ def priority(
         return "P0"
 
     kind = facts.get("kind")
+    base: Priority
     if kind == "bug":
         if (
             facts.get("has_reproduction")

@@ -21,6 +21,7 @@ from app import context as context_module
 from app import github, policy, usage
 from app.extract import extract_facts
 from app.state import Action, Facts, TriageState
+from app.usage import NodeTiming
 
 
 def extract_node(state: TriageState) -> dict:
@@ -36,10 +37,11 @@ def extract_node(state: TriageState) -> dict:
         "area_confidence": raw.get("area_confidence", "low"),
         "kind": raw.get("kind", "question"),
         "evidence": raw.get("evidence", {}),
+        # Passed through untouched -- deliberately read from the issue, not from
+        # `raw`, so no model output can reach policy's pattern matching. Built
+        # here rather than assigned afterwards so the literal satisfies Facts.
+        "body": issue["body"],
     }
-    # Pass body through untouched (not model output) so policy.priority can
-    # match data-loss/build-breaking patterns without re-fetching the issue.
-    facts["body"] = issue["body"]
     return {"facts": facts}
 
 
@@ -170,7 +172,7 @@ def _instrumented(name: str, fn):
             update = fn(state)
             wall_ms = (time.perf_counter() - started) * 1000
 
-        timing = {"node": name, "wall_ms": round(wall_ms, 1)}
+        timing: NodeTiming = {"node": name, "wall_ms": round(wall_ms, 1)}
         merged = dict(update or {})
         merged["llm_calls"] = calls
         merged["node_timings"] = [timing]
