@@ -17,7 +17,10 @@ hundred. Fetched issues are cached under eval/cache/ so re-running to compare
 prompt versions doesn't re-hit the GitHub API -- and so every version is scored
 against the same sample rather than a fresh one that has drifted.
 
-Run: python -m eval.replay --n 150 --version v4
+Run: python -m eval.replay --n 150 --version v6
+
+To re-score a finished run through the autonomy gate without re-extracting,
+see eval/gate.py.
 """
 
 import argparse
@@ -32,6 +35,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from app import context as context_module
 from app import github, policy, usage
 from app.extract import extract_facts
 
@@ -203,9 +207,17 @@ def score_issues(selected: list[tuple[dict, str]], concurrency: int) -> list[dic
             "predicted": predicted,
             "correct": predicted == actual,
             "extraction_failed": not bool(facts),
-            # Telemetry. wall_ms covers extraction only -- the eval calls
-            # extract_facts directly and never fetches reporter context, so this
-            # is not the full agent latency. Retries inflate it, which is the
+            # The extractor's own output, kept so eval.gate can re-score this
+            # run through policy.review_reasons without paying for extraction
+            # again. `evidence` is dropped: it is verbatim quotes for a human
+            # reading one issue, no policy branch reads it, and at 150 rows it
+            # would be most of the file. Results files written before this key
+            # existed (v1-v5) cannot be gate-scored.
+            "facts": {k: v for k, v in facts.items() if k != "evidence"},
+            # Telemetry. wall_ms covers extraction only -- the reporter-context
+            # lookup happens in a separate serial pass afterwards and is a
+            # GitHub call, not a model call, so this is not the full agent
+            # latency. Retries inflate it, which is the
             # point: a retried 429 is latency the caller really waited.
             "wall_ms": round(wall_ms, 1),
             "llm_calls": len(calls),
@@ -219,6 +231,51 @@ def score_issues(selected: list[tuple[dict, str]], concurrency: int) -> list[dic
         rows = list(pool.map(work, selected))
     print(file=sys.stderr)
     return rows
+
+
+def attach_reporter_context(
+    selected: list[tuple[dict, str]],
+    rows: list[dict],
+    delay_seconds: float,
+) -> None:
+    """Look up each reporter and record the context on its row, in place.
+
+    The live graph runs extract -> fetch_context -> decide, so a results file
+    without this is missing an input two policy branches read: the one-step
+    escalation in policy.priority, and the gate's "reporter context
+    unavailable". eval.gate re-scores those branches, and it can only do that
+    honestly against the context the run would really have had.
+
+    Serial with a pacing delay, unlike extraction: this hits the GitHub *search*
+    API, which allows 30 requests/minute authenticated. Running it at the
+    extraction concurrency would turn most of these lookups into rate-limited
+    failures, and a failed lookup is not a neutral omission here -- it reads as
+    unknown=True, which is itself a gate condition. The eval would then be
+    measuring its own rate limit.
+
+    This is a GitHub call, not an LLM call, so it is deliberately outside the
+    usage collector and absent from the cost and latency figures.
+    """
+    total = len(selected)
+    unknown = 0
+    print(
+        f"fetching reporter context for {total} issues (serial, ~{delay_seconds}s apart)..."
+    )
+    for index, ((issue, _), row) in enumerate(
+        zip(selected, rows, strict=True), start=1
+    ):
+        reporter_context = context_module.fetch_reporter_context(issue)
+        row["reporter_context"] = reporter_context
+        unknown += bool(reporter_context["unknown"])
+        print(
+            f"\r  context {index}/{total} ({unknown} unknown)",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        if index < total and delay_seconds:
+            time.sleep(delay_seconds)
+    print(file=sys.stderr)
 
 
 def per_component_metrics(rows: list[dict]) -> list[dict]:
@@ -524,6 +581,7 @@ def run_eval(
     fetch_n: int,
     concurrency: int,
     refresh: bool,
+    context_delay: float | None,
 ) -> dict:
     issues, _ = load_or_fetch(repo, fetch_n, refresh=refresh)
     selected, funnel = select_scorable(issues, n)
@@ -538,6 +596,14 @@ def run_eval(
         )
 
     rows = score_issues(selected, concurrency)
+    if context_delay is None:
+        print(
+            "skipping reporter context (--no-context); rows will carry none and "
+            "eval.gate will report the context condition as unmeasured",
+            file=sys.stderr,
+        )
+    else:
+        attach_reporter_context(selected, rows, context_delay)
     return summarise(rows, repo, version, funnel, requested_n=n)
 
 
@@ -568,6 +634,19 @@ def main() -> None:
         action="store_true",
         help="ignore the cached issues and re-fetch from GitHub",
     )
+    parser.add_argument(
+        "--no-context",
+        action="store_true",
+        help="skip the reporter-context lookup (faster, no GitHub search calls, "
+        "but the resulting file can't be gate-scored on the context condition)",
+    )
+    parser.add_argument(
+        "--context-delay",
+        type=float,
+        default=2.1,
+        help="seconds between reporter-context lookups (default 2.1, which "
+        "keeps under the search API's 30/min authenticated limit)",
+    )
     args = parser.parse_args()
 
     if args.concurrency < 1:
@@ -581,6 +660,7 @@ def main() -> None:
         fetch_n=max(args.fetch, args.n),
         concurrency=args.concurrency,
         refresh=args.refresh,
+        context_delay=None if args.no_context else args.context_delay,
     )
 
     print_report(summary)

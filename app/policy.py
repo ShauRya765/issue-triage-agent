@@ -208,6 +208,75 @@ def actions(facts: Facts, priority_value: str, component_value: str) -> list[Act
 # falls through to requiring review.
 
 
+# The gate conditions, in the order they are checked. Named here so the
+# offline gate measurement (eval/gate.py) can report a breakdown by condition
+# without hard-coding the strings a second time and drifting from these.
+P0_REASON = "P0 issues always get a human"
+COMMENT_REASON = "posting a comment to a reporter needs a human"
+NO_COMPONENT_REASON = "component could not be determined"
+LOW_CONFIDENCE_REASON = "low model confidence in the claimed area"
+EXTRACTION_REASON = "fact extraction failed"
+NO_CONTEXT_REASON = "reporter context unavailable"
+
+GATE_CONDITIONS: tuple[str, ...] = (
+    P0_REASON,
+    COMMENT_REASON,
+    NO_COMPONENT_REASON,
+    LOW_CONFIDENCE_REASON,
+    EXTRACTION_REASON,
+    NO_CONTEXT_REASON,
+)
+
+
+def review_reasons(
+    facts: Facts,
+    priority_value: str,
+    component_value: str,
+    proposed: list[Action],
+    context: ReporterContext | None = None,
+) -> list[str]:
+    """Every gate condition this run trips, in GATE_CONDITIONS order.
+
+    Empty means the run may execute autonomously. review_reason returns the
+    first of these, which is what the graph records and acts on; the full list
+    exists because "which condition stopped this run" and "which conditions
+    would have stopped it" are different questions, and only the second one can
+    tell you whether a condition is doing any work or is decoration. Every
+    branch is evaluated independently here -- no short-circuiting -- so a
+    condition is never credited merely for being checked first.
+    """
+    reasons: list[str] = []
+
+    if priority_value == "P0":
+        # A P0 is by definition the case where being wrong is most expensive.
+        reasons.append(P0_REASON)
+
+    if any(action["type"] == "comment" for action in proposed):
+        # A label is cheap to remove and nobody is notified. A comment emails
+        # every subscriber and can't be unsent -- a wrong one is a public
+        # mistake on someone else's issue.
+        reasons.append(COMMENT_REASON)
+
+    if component_value == "needs-triage":
+        # We couldn't route it, which is exactly when a human adds value.
+        reasons.append(NO_COMPONENT_REASON)
+
+    if facts.get("area_confidence") != "high":
+        reasons.append(LOW_CONFIDENCE_REASON)
+
+    if not facts.get("kind"):
+        # extract_facts returns {} on any failure; the graph fills defaults.
+        # An empty kind means we're acting on an extraction that didn't happen.
+        reasons.append(EXTRACTION_REASON)
+
+    if context is not None and context.get("unknown"):
+        # We asked for reporter context and couldn't get it. Acting anyway
+        # means acting on a rule whose inputs we know are incomplete.
+        reasons.append(NO_CONTEXT_REASON)
+
+    return reasons
+
+
 def review_reason(
     facts: Facts,
     priority_value: str,
@@ -221,34 +290,8 @@ def review_reason(
     recorded on the graph state, so a run that paused can be explained after
     the fact without re-deriving the decision.
     """
-    if priority_value == "P0":
-        # A P0 is by definition the case where being wrong is most expensive.
-        return "P0 issues always get a human"
-
-    if any(action["type"] == "comment" for action in proposed):
-        # A label is cheap to remove and nobody is notified. A comment emails
-        # every subscriber and can't be unsent -- a wrong one is a public
-        # mistake on someone else's issue.
-        return "posting a comment to a reporter needs a human"
-
-    if component_value == "needs-triage":
-        # We couldn't route it, which is exactly when a human adds value.
-        return "component could not be determined"
-
-    if facts.get("area_confidence") != "high":
-        return "low model confidence in the claimed area"
-
-    if not facts.get("kind"):
-        # extract_facts returns {} on any failure; the graph fills defaults.
-        # An empty kind means we're acting on an extraction that didn't happen.
-        return "fact extraction failed"
-
-    if context is not None and context.get("unknown"):
-        # We asked for reporter context and couldn't get it. Acting anyway
-        # means acting on a rule whose inputs we know are incomplete.
-        return "reporter context unavailable"
-
-    return None
+    reasons = review_reasons(facts, priority_value, component_value, proposed, context)
+    return reasons[0] if reasons else None
 
 
 def requires_review(

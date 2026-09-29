@@ -122,3 +122,30 @@ class TriageState(TypedDict, total=False):
     # is parked at the human_review interrupt still reports what it has spent so
     # far. See app.usage.summarise for the shape.
     usage: dict
+
+
+def facts_from_raw(raw: dict, body: str) -> Facts:
+    """Fill a raw extractor dict out into the full Facts shape.
+
+    Lives here, next to the TypedDict it satisfies, because two callers build
+    Facts from the same raw extractor output -- the extract node on a live run,
+    and eval.gate when it re-scores a stored results file. If they filled the
+    defaults differently the offline measurement would be of a gate that never
+    ran, so there is one function and both call it.
+
+    `body` is a parameter rather than a key read out of `raw` on purpose: it is
+    the only field on Facts no model authored, and app.policy matches its
+    data-loss and build-breaking patterns against it. Taking it from the issue
+    keeps model output out of that path by construction.
+    """
+    return Facts(
+        has_version=bool(raw.get("has_version", False)),
+        has_reproduction=bool(raw.get("has_reproduction", False)),
+        has_logs=bool(raw.get("has_logs", False)),
+        has_expected_behaviour=bool(raw.get("has_expected_behaviour", False)),
+        claimed_area=raw.get("claimed_area"),
+        area_confidence=raw.get("area_confidence", "low"),
+        kind=raw.get("kind", "question"),
+        evidence=raw.get("evidence", {}),
+        body=body,
+    )

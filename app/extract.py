@@ -131,6 +131,34 @@ def _build_user_prompt(title: str, body: str) -> str:
     return f"Issue title: {title}\n\nIssue body:\n{body}"
 
 
+def _prompt_caching_enabled() -> bool:
+    """Default on. Set PROMPT_CACHE=false to send the system prompt uncached."""
+    return os.environ.get("PROMPT_CACHE", "true").lower() != "false"
+
+
+def _system_message(prompt: str):
+    """The system turn, with a cache breakpoint on it when caching is enabled.
+
+    The system prompt is byte-identical on every call and is the whole of the
+    cacheable prefix here -- there are no tools, and caching is a prefix match
+    in tools -> system -> messages order, so the issue text in the human turn
+    sits after the breakpoint and never invalidates it.
+
+    A marker is not a guarantee. Anthropic will not create an entry for a prefix
+    below a model-dependent minimum -- 1024 tokens on Sonnet 5 -- and returns no
+    error when it declines, just zeroes in the usage block. This prompt measures
+    848 tokens, so on this model the breakpoint is inert; app.usage records
+    cache_creation/cache_read separately precisely so that is visible in the
+    numbers rather than assumed either way. See README, "What caching saved".
+    """
+    if not _prompt_caching_enabled():
+        return ("system", prompt)
+    return (
+        "system",
+        [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+    )
+
+
 def _content_to_text(content) -> str:
     """Flatten a model response into plain text.
 
@@ -194,7 +222,7 @@ def extract_facts(title: str, body: str) -> dict:
     """
     model_name = os.environ.get("MODEL", "claude-sonnet-5")
     messages = [
-        ("system", _system_prompt()),
+        _system_message(_system_prompt()),
         ("human", _build_user_prompt(title, body)),
     ]
 
@@ -206,8 +234,15 @@ def extract_facts(title: str, body: str) -> dict:
             wall_ms = (time.perf_counter() - started) * 1000
             # Record before parsing: a reply that fails to parse still cost
             # tokens and time, and hiding it would understate the real spend.
-            served_model, input_tokens, output_tokens = usage.extract_usage(response)
-            usage.record_call(served_model, input_tokens, output_tokens, wall_ms)
+            billed = usage.extract_usage(response)
+            usage.record_call(
+                billed["model"],
+                billed["input_tokens"],
+                billed["output_tokens"],
+                wall_ms,
+                cache_write_tokens=billed["cache_write_tokens"],
+                cache_read_tokens=billed["cache_read_tokens"],
+            )
             parsed = _parse_response(response.content)
             if not parsed:
                 logger.warning(

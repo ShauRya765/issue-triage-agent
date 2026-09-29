@@ -11,14 +11,15 @@ then executes them (or, in `SHADOW_MODE`, just says what it would have done).
 
 | | |
 |---|---|
-| **Component-label accuracy** | **74.0%** on 150 closed issues, 95% CI [66%, 80%]. An identical re-run scored 73.3%. |
+| **Component-label accuracy** | **74.0%** on 150 closed issues, 95% CI [66%, 80%]. Two identical re-runs scored 73.3% and 71.3%. |
 | **vs. naive baselines** | 37.3% always-guess-the-most-common-label, 16.9% weighted random -- the agent is **2.0x** the majority-class bar, and 3.4x once the dominant label is removed. |
 | **Failure split** | 18.7% abstained to `needs-triage`, 7.3% applied a wrong label. Abstentions can never execute without a human. |
+| **Autonomy gate, measured** | 38% of runs would execute unsupervised -- and **8 of 11 mislabels are among them**, so the mislabel rate on unsupervised runs is **14%, double the headline 7.3%**. The gate filters abstentions, not confident mistakes. [Details](#does-the-autonomy-gate-actually-stop-the-mislabels) |
 | **Cost and latency** | **$0.0082** per triaged issue; **3.3s** median, **6.5s** p95. |
 | **Durable pause** | **Verified against real Postgres**, not just `MemorySaver`: one process paused at human review and exited, a second process recovered the state, applied an *edited* action list, and executed it -- once. |
 | **Who decides** | Plain Python in `app/policy.py`, never the model. It makes zero LLM calls, and its tests pass with no API key and no network. |
 
-Details: [Results](#results) · [Cost and latency](#cost-and-latency) · [Human in the loop](#human-in-the-loop-and-running-alone)
+Details: [Results](#results) · [Does the gate stop the mislabels?](#does-the-autonomy-gate-actually-stop-the-mislabels) · [Cost and latency](#cost-and-latency) · [Human in the loop](#human-in-the-loop-and-running-alone)
 
 ## The central design rule
 
@@ -116,7 +117,7 @@ app/extract.py   the only LLM calls (claude-sonnet-5 via langchain_anthropic);
 app/context.py   reporter lookup (tier + prior issue count); a fetch, no LLM,
                  fails soft to unknown
 app/policy.py    every decision; pure, offline, no LLM, no graph import --
-                 priority, component, actions, review_reason, validate_actions
+                 priority, component, actions, review_reason(s), validate_actions
 app/graph.py     extract -> fetch_context -> decide -> propose -> (human_review
                  interrupt | auto_approve) -> execute, checkpointed to Supabase
 app/main.py      FastAPI: GET /issues, POST /runs, POST /runs/{number},
@@ -126,11 +127,16 @@ app/usage.py     cost + latency telemetry: per-call tokens/wall time/model/
 eval/replay.py   fetch closed issues (cached to eval/cache/), run the same
                  extract+policy path in parallel, score predicted vs actual
                  component label with per-component precision and recall
+eval/gate.py     re-score a finished results file through the autonomy gate
+                 with no model calls: what would have executed alone, and how
+                 often that would have been wrong
 tests/test_policy.py      priority, component, actions, escalation, the
                           autonomy gate, action validation
 tests/test_context.py     tier mapping and the fail-soft paths
 tests/test_graph.py       routing, the pause, edited approvals, idempotency
 tests/test_eval.py        the eval's exclusions and scoring arithmetic
+tests/test_gate.py        the gate replay: that it replays the shipped gate,
+                          and refuses results files that predate its fields
 tests/test_usage.py       cost arithmetic, rate config, usage collection
 tests/conftest.py         blocks sockets, so the suite can't quietly go online
 ENGINEERING_NOTES.md      decisions, tradeoffs and what's still unproven
@@ -307,6 +313,11 @@ run executes alone only when all of these hold:
 lets a scheduler start work unprompted. Every issue still goes through the same
 gate.
 
+That table is the argument for the gate. It is not evidence that the gate works,
+so the gate is measured separately against 150 real issues, and the measurement
+is less flattering than the argument:
+[Does the autonomy gate actually stop the mislabels?](#does-the-autonomy-gate-actually-stop-the-mislabels)
+
 ## Customer context
 
 `app/context.py` fetches, per issue: the reporter's login, a tier normalised
@@ -440,6 +451,7 @@ fetched is bot-closed before that filter even applies.
 | v3 | 15 | 66.7% | [42%, 85%] | Injected the real label vocabulary into the extraction prompt. Diagnosis: the model was confident (6/7 misses at `high`) but naming areas that don't exist -- `next-devtools`, `Use Cache`, `Telemetry`. It was guessing a taxonomy nobody had shown it. |
 | v4 | **150** | **74.0%** | **[66%, 80%]** | **Sample size only.** Identical prompt, identical policy -- v4 is v3 measured properly, not a new change. |
 | v5 | 150 | 73.3% | [66%, 80%] | Cost/latency instrumentation added; prompt and policy still identical. Same 150 issues, so this doubles as a same-config replication of v4: 73.3% vs 74.0% is one issue's difference, which is what run-to-run variance looks like at this n. |
+| v6 | 150 | 71.3% | [64%, 78%] | Records per-issue facts and reporter context so the autonomy gate can be re-scored offline (see below). Prompt, policy and model still identical, so this is a *third* same-config replication: 74.0% / 73.3% / 71.3% across three runs of the same system on the same 150 issues. Two extractions failed outright this time (v4: zero, v5: one), which accounts for two of the three issues separating it from v4. |
 
 Both baselines are computed by `eval.replay` over the same scored set as the
 headline number, and printed on every run. They are sample-specific, so the two
@@ -508,6 +520,104 @@ expected case and a swallowed 429 would have scored as a miss -- deflating
 accuracy for a reason unrelated to the prompt. It is a reliability change, not a
 prompt change, and it demonstrably didn't alter the outcome here: v4 recorded
 zero extraction failures, so no retry changed a row.
+
+### Does the autonomy gate actually stop the mislabels?
+
+Everything above measures the label. It does not measure the thing you would
+actually be turning on. With `AUTONOMOUS=true` only the runs `policy.review_reason`
+clears execute unsupervised, so the deployment question is narrower and harder:
+**of the runs that go out alone, how many are wrong -- and how many runs is that?**
+
+`eval/gate.py` answers it from a finished results file, with no model calls. It
+replays each recorded extraction plus the issue's real body and labels back
+through `policy.priority` -> `policy.actions` -> `policy.review_reasons`, the same
+sequence `decide_node` and `propose_node` take, and reports what the gate would
+have done. Because it re-scores rather than re-extracts, changing the gate and
+re-measuring costs nothing:
+
+```
+python -m eval.gate --version v6
+```
+
+On v6's 150 issues:
+
+| | |
+|---|---|
+| **Cleared the gate** | **57 of 150 (38.0%)** would have executed with no human |
+| **Mislabels that cleared it** | **8 of 11.** The gate stopped 3 |
+| **Abstentions it stopped twice** | **32 of 32** -- every abstention tripped a second condition as well |
+| **Mislabel rate among cleared runs** | **14.0% (8/57)**, against 7.3% over all 150 |
+
+**The gate does not stop the mislabels, and the headline number was hiding
+that.** The overall 7.3% mislabel rate counts abstentions as part of the error
+budget, and abstentions are exactly what the gate is good at catching -- all 32
+are stopped, twice over. Strip them out and what remains in the autonomous lane
+is the failure mode the gate has no grip on: the model was confident, named a
+real label, and named the wrong one. Nothing downstream re-examines a confident
+claim, so **the mislabel rate roughly doubles on the runs that matter** -- 14.0%
+unsupervised versus 7.3% overall. Accuracy among cleared runs is 86.0%
+[74.7%, 92.7%], which reads well until you notice the other 14% is entirely
+wrong labels rather than a mix of wrong labels and harmless abstentions.
+
+Six of those eight escaping mislabels apply `Cache Components`, the same
+over-applied sink already called out above. That is not a coincidence and it
+locates the fix: **the gate is not the thing to change -- precision on
+`Cache Components` is.** A gate cannot filter a mistake the extractor reports as
+high confidence, because high confidence is the only signal it has.
+
+**Which condition was doing the work:**
+
+| Condition | Runs tripped | Sole reason | Mislabels caught alone |
+|---|---|---|---|
+| Posting a comment to a reporter needs a human | 74 | 53 | 3 |
+| P0 issues always get a human | 9 | 6 | 0 |
+| Component could not be determined | 32 | 0 | 0 |
+| Low model confidence in the claimed area | 32 | 0 | 0 |
+| Fact extraction failed | 0 | 0 | 0 |
+| Reporter context unavailable | 0 | 0 | 0 |
+
+"Sole reason" is the honest column: how often a condition was the *only* thing
+standing between that run and execution. A condition that is never the sole
+reason never changed an outcome on this sample.
+
+- **One condition carries the gate.** The comment rule stopped 53 runs on its
+  own -- more than every other condition combined -- and caught all 3 of the
+  mislabels the gate did catch. Drop it and clearance goes from 57 to 110 of
+  150. It is load-bearing for a reason that has nothing to do with labelling
+  accuracy: it fires whenever the issue is missing a repro, a version, logs or
+  expected behaviour, which on this repo is most issues.
+- **Two conditions are exactly redundant here.** "Component could not be
+  determined" and "low model confidence" tripped on the same 32 runs, never
+  separately. That is structural, not luck: `policy.component` only returns a
+  label when `area_confidence == "high"`, so a low-confidence claim *always*
+  abstains -- the second check cannot fire without the first. The reverse is not
+  structural: a high-confidence claim naming a label the repo doesn't use would
+  trip only the first. None did here, which is itself the v3 fix still holding.
+- **Two conditions never fired at all.** All 150 reporter-context lookups
+  succeeded, so that branch is untested by this sample (it would fire live under
+  a search-API rate limit, which is the case it exists for). "Fact extraction
+  failed" is dead by construction rather than by luck: the two runs whose
+  extraction *did* fail were caught by three other conditions, because
+  `extract_node` defaults a missing `kind` to `"question"` and the check tests
+  `not facts.get("kind")`. It cannot fire in the shipped graph.
+
+**Nothing was changed in response to any of this.** The gate as measured is the
+gate as shipped; tuning it against the sample that exposed it would fit it to
+150 issues. Three follow-ups fall out of the numbers, in the order the numbers
+justify them: fix `Cache Components` precision (it is the whole autonomous
+failure mode), make the extraction-failure check test something that can
+actually be false, and decide whether "low confidence" earns its place as a
+separate condition or should be folded into `policy.component`.
+
+**Two limits on these numbers.** They re-score the *gate*, not the model: facts
+are replayed as recorded, so this is what the gate would have done with that
+extraction, not what a rerun would produce. And `eval/gate.py` needs the `facts`
+and `reporter_context` keys that v6 was the first run to write, plus the issue
+cache for bodies and labels -- v1-v5 predate those fields and are rejected by
+name rather than scored with defaults standing in for data. The full
+per-condition breakdown is written to `eval/results/v6-gate.json` by
+`--out`; like `eval/results/` and `eval/cache/` generally it is gitignored, so
+reproducing these numbers from a fresh clone means re-running the eval first.
 
 Earlier runs are kept rather than overwritten: `eval/results/v1.json` is the
 record of what a silently-broken extractor scores, which is the comparison that

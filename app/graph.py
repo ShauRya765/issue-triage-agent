@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from app import context as context_module
 from app import github, policy, usage
 from app.extract import extract_facts
-from app.state import Action, Facts, TriageState
+from app.state import Action, Facts, TriageState, facts_from_raw
 from app.usage import NodeTiming
 
 
@@ -28,20 +28,11 @@ def extract_node(state: TriageState) -> dict:
     issue = state["issue"]
     raw = extract_facts(issue["title"], issue["body"])
 
-    facts: Facts = {
-        "has_version": bool(raw.get("has_version", False)),
-        "has_reproduction": bool(raw.get("has_reproduction", False)),
-        "has_logs": bool(raw.get("has_logs", False)),
-        "has_expected_behaviour": bool(raw.get("has_expected_behaviour", False)),
-        "claimed_area": raw.get("claimed_area"),
-        "area_confidence": raw.get("area_confidence", "low"),
-        "kind": raw.get("kind", "question"),
-        "evidence": raw.get("evidence", {}),
-        # Passed through untouched -- deliberately read from the issue, not from
-        # `raw`, so no model output can reach policy's pattern matching. Built
-        # here rather than assigned afterwards so the literal satisfies Facts.
-        "body": issue["body"],
-    }
+    # Defaults are filled by state.facts_from_raw, which eval.gate also calls
+    # when it re-scores a stored run -- so the offline measurement sees the same
+    # Facts this node would have built. body is passed from the issue, never
+    # read out of `raw`, so no model output reaches policy's pattern matching.
+    facts: Facts = facts_from_raw(raw, issue["body"])
     return {"facts": facts}
 
 
