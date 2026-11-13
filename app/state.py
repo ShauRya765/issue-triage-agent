@@ -17,6 +17,8 @@ from app.usage import LLMCall, NodeTiming
 # and losing the check exactly where a typo would do damage.
 Priority = Literal["P0", "P1", "P2", "P3"]
 Tier = Literal["internal", "contributor", "external"]
+Intent = Literal["bug_report", "feature_request", "question", "duplicate", "other"]
+GateOutcome = Literal["proceed", "clarify", "handoff"]
 
 
 class Issue(TypedDict):
@@ -99,6 +101,51 @@ class Action(TypedDict):
     body: str | None
 
 
+class IntentClassification(TypedDict):
+    """The model's intent call. Model-authored; the gate decides what it means."""
+
+    intent: Intent
+    confidence: float
+    rationale: str
+
+
+class SlotState(TypedDict):
+    # Verbatim quote from the issue or a reply, or None if not supplied.
+    value: str | None
+    # Computed by app.intents.mark_slots, not reported by the model.
+    filled: bool
+
+
+class Turn(TypedDict):
+    """One message in the clarification conversation, in posting order."""
+
+    role: Literal["agent", "reporter"]
+    body: str
+    # GitHub comment id for reporter replies; None for agent comments (which
+    # may never have been posted, under DRY_RUN).
+    comment_id: int | None
+    at: str
+
+
+class GateDecision(TypedDict):
+    """One pass through the intent gate, recorded so the console can show why."""
+
+    outcome: GateOutcome
+    reason: str
+    # How many clarification comments had been sent when this decision was made.
+    attempts: int
+
+
+class Correction(TypedDict):
+    """A reviewer's change to model output, kept as before/after for eval."""
+
+    field: Literal["intent", "slot"]
+    # Slot name for field="slot"; None for intent.
+    name: str | None
+    before: str | None
+    after: str | None
+
+
 class TriageState(TypedDict, total=False):
     issue: Issue
     facts: Facts
@@ -113,6 +160,18 @@ class TriageState(TypedDict, total=False):
     # Recorded on the state so an autonomous run is auditable after the fact.
     review_required: bool
     review_reason: str
+    # Intent and slot extraction (app.intents), and the clarification loop.
+    intent: IntentClassification
+    slots: dict[str, SlotState]
+    missing_slots: list[str]
+    clarification_attempts: int
+    conversation: list[Turn]
+    # Appended to on every gate pass, so the full history of why the run went
+    # where it went survives across clarification turns.
+    gate_decisions: Annotated[list[GateDecision], operator.add]
+    # Set when the intent gate hands off: what is still missing, for the human.
+    handoff_summary: str
+    corrections: list[Correction]
     # Telemetry. Both lists use operator.add so each node appends its own record
     # instead of overwriting the previous node's -- without a reducer, the last
     # node to return would be the only one represented.

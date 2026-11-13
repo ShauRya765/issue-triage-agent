@@ -1,0 +1,78 @@
+# Required slots per intent, and the wording used to ask for each one.
+#
+# This file is the single source of truth for "what does a complete issue of
+# this kind look like". The model only reports what it found in the text; code
+# in app/intents.py compares that against `required` here to decide what is
+# missing. Changing what counts as complete is an edit to this file, not to a
+# prompt.
+#
+# `question` is the exact text the clarification comment uses for that slot.
+# Comments are built from these templates, never written by the model, so the
+# agent only ever posts wording a human wrote and reviewed here.
+
+intents:
+  bug_report:
+    description: Something that used to work, or should work, does not.
+    intro: >-
+      Thanks for the report! To help us reproduce this, could you add the
+      following?
+    required:
+      - version
+      - steps_to_reproduce
+      - expected_behavior
+      - actual_behavior
+
+  feature_request:
+    description: A request for new behaviour or a change to existing behaviour.
+    intro: >-
+      Thanks for the suggestion! To help us weigh it, could you tell us a bit
+      more?
+    required:
+      - use_case
+
+  question:
+    description: Asking how to do something, or how something works.
+    intro: ""
+    required: []
+
+  duplicate:
+    description: >-
+      The reporter says this is the same as an existing issue, or links one as
+      the same problem.
+    intro: ""
+    required: []
+
+  other:
+    description: Anything else -- docs fixes, discussion, spam, unclear text.
+    intro: ""
+    required: []
+
+slots:
+  version:
+    description: >-
+      The specific Next.js version in use, e.g. "15.1.3" or "canary
+      15.2.0-canary.12". "latest" or "the newest one" does not count.
+    question: Which Next.js version are you using (the output of `next info` is ideal)?
+
+  steps_to_reproduce:
+    description: >-
+      Concrete steps, a repository link, or a sandbox link that would let
+      someone else see the problem. "It happens sometimes" does not count.
+    question: >-
+      Steps to reproduce, or better, a link to a minimal repository or sandbox
+      that shows the problem.
+
+  expected_behavior:
+    description: What the reporter expected to happen.
+    question: What did you expect to happen?
+
+  actual_behavior:
+    description: >-
+      What actually happened -- the error, output, or behaviour observed.
+    question: What happened instead (including any error output)?
+
+  use_case:
+    description: >-
+      The problem the reporter is trying to solve, or the situation where the
+      feature would be used -- not just the feature itself.
+    question: What are you trying to accomplish, and how would this feature help?
